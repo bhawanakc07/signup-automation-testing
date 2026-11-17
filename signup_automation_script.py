@@ -1,349 +1,317 @@
-# Signup automation for https://authorized-partner.vercel.app/
+
+import base64
 import json
-import os
 import random
 import re
+import sys
 import time
+from pathlib import Path
 
-from playwright.sync_api import sync_playwright, expect
+from playwright.sync_api import expect, sync_playwright
 
-URL = os.getenv("BASE_URL", "https://authorized-partner.vercel.app")
-HEADLESS = os.getenv("HEADLESS", "no") == "yes"
-CHANNEL = os.getenv("BROWSER_CHANNEL") or None
+BASE_URL = "https://authorized-partner.vercel.app"
+OTP_WAIT_MS = 5 * 60 * 1000  # we give ourselves 5 minutes to type the OTP
 
-ts = str(int(time.time()))
-with open("test_data.json", encoding="utf-8") as f:
-    data = json.loads(f.read().replace("{ts}", ts))
-
-phone_used = ""          # filled in later, the phone is made by this script
-api = {"sent": 0, "limit": False, "seen_limit": False, "retry": None}
+SHOT_DIR = Path("artifacts/screenshots")
+SHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def new_phone():
-    # real Nepali mobile prefix + 7 digits
-    return random.choice(["980", "981", "982", "984", "985", "986"]) + str(random.randint(1000000, 9999999))
+# ----------------------------------------------------------------- helper functions
+def make_phone():
+    """Make a random 10 digit Nepali mobile number, e.g. 9841234567."""
+    prefix = random.choice(["980", "981", "982", "984", "985", "974", "975"])
+    rest = "".join(random.choices("0123456789", k=7))
+    return prefix + rest
 
 
+def load_data():
+    """Read test_data.json and replace {ts} and {phone} with fresh values."""
+    text = Path("test_data.json").read_text(encoding="utf-8")
+    text = text.replace("{ts}", str(int(time.time())))
+    text = text.replace("{phone}", make_phone())
+    return json.loads(text)
 
-def on_request(req):
-    if req.method == "POST":
-        api["sent"] += 1
+
+def shot(page, name, full=False):
+    """Save a screenshot in artifacts/screenshots/."""
+    page.screenshot(path=SHOT_DIR / f"{name}.png", full_page=full)
+    print("Screenshot saved:", name)
 
 
-def on_response(resp):
-    if resp.request.method != "POST":
+def log_api(response):
+    """Print the calls made to the backend, so we can see what the server answered."""
+    if "stage.cloudedu.com.au" in response.url:
+        print("[API]", response.request.method, response.status, response.url)
+
+
+def fill_after_label(page, label, value):
+    """Find the text box that belongs to a label (like 'First Name') and type into it."""
+    box = page.get_by_label(label, exact=True)
+    if box.count() != 1:
+        # fallback: the first input that comes after the label text
+        box = page.locator(
+            f"xpath=(//*[normalize-space(text())='{label}'])[1]"
+            "/following::*[self::input or self::textarea][1]"
+        )
+    box = box.first
+    box.wait_for()
+    if box.is_editable():  # some boxes are already filled and locked
+        box.fill(value)
+
+
+def choose_from_dropdown(page, label, option):
+    """Open the dropdown that belongs to a label and click one option."""
+    dropdown = page.locator(
+        f"xpath=(//*[normalize-space(text())='{label}'])[1]"
+        "/following::*[self::select or @role='combobox' or self::button][1]"
+    )
+    dropdown.wait_for()
+    if dropdown.evaluate("e => e.tagName") == "SELECT":
+        dropdown.select_option(label=option)  # normal <select> dropdown
         return
+
+    dropdown.click()  # custom dropdown: open it first
+    page.wait_for_timeout(500)
+
+    # look for a real, visible option first
+    choice = page.get_by_role("option", name=option)
+    if choice.count() == 0:
+        # only if there is no real option, search by plain text
+        choice = page.get_by_text(option, exact=True)
+    choice.first.click()
+
+
+def tick_checkbox(page, text):
+    """Tick a checkbox using the text next to it."""
     try:
-        body = " ".join(resp.text().split())[:150]
+        page.get_by_role("checkbox", name=text).click(timeout=3000)
     except Exception:
-        body = ""
-    print("[API]", resp.status, resp.url, body)
-    if resp.status == 429:
-        api["limit"] = True
-        api["seen_limit"] = True
-        api["retry"] = resp.headers.get("retry-after")
+        page.get_by_text(text, exact=True).first.click()
 
 
-
-def fill(page, label, value):
-    # the label is not always linked to the input, so try a few ways
-    ways = [
-        page.get_by_label(label, exact=True),
-        page.get_by_label(re.compile(label, re.I)),
-        page.get_by_placeholder(re.compile(label, re.I)),
-        page.locator(f"xpath=(//*[starts-with(normalize-space(text()),'{label}')])[1]/following::input[1]"),
-    ]
-    for way in ways:
-        if way.count() > 0:
-            way.first.fill(value)
-            return
-    raise Exception(f"Field '{label}' not found")
+def make_png(path):
+    """Create a tiny PNG image that we can upload as a document."""
+    path.write_bytes(base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    ))
+    return path
 
 
-def fill_passwords(page, value):
-    # password boxes have no label, find them by type
-    boxes = page.locator("input[type='password']")
-    boxes.first.wait_for()
-    for i in range(boxes.count()):
-        boxes.nth(i).fill(value)
-
-
-def choose(page, label, option):
-    # open the dropdown below the label and click the option
-    page.locator(f"xpath=(//*[normalize-space(text())='{label}'])[1]"
-                 "/following::*[@role='combobox' or self::select or self::button][1]").click()
-    page.get_by_role("option", name=re.compile(option, re.I)).first.click()
-
-
-def click_next(page):
-    # click Next, and click again only if the page did not send anything
-    otp_title = page.get_by_text("Email Verification code").first
-    button = page.get_by_role("button", name="Next", exact=True)
-    for attempt in range(4):
-        before = api["sent"]
-        button.scroll_into_view_if_needed()
-        expect(button).to_be_enabled()
-        if attempt == 0:
-            button.click()
-        elif attempt == 1:
-            button.click(force=True)
-        elif attempt == 2:
-            button.focus()
-            page.keyboard.press("Enter")
-        else:
-            button.dispatch_event("click")
-        for _ in range(8):
-            page.wait_for_timeout(400)
-            if api["sent"] > before or otp_title.is_visible() or page.get_by_text("valid phone").count() > 0:
-                return
-        print(f"Next click {attempt + 1} did nothing, trying another way")
-
-
-def page_errors(page):
-    # red messages under fields, alerts and toasts (helps to see why Next does nothing)
-    found = []
-    for t in page.locator("[role='alert'], [data-sonner-toast], [id$='-form-item-message'], "
-                          "p.text-destructive, p[class*='text-red']").all_inner_texts():
-        t = " ".join(t.split())
-        if t and t not in found:
-            found.append(t)
-    return found
-
-
-def go_next(page, target):
-    # click Next and wait until the next page (target) shows. If the click was lost, click again.
-    button = page.get_by_role("button", name="Next", exact=True)
-    page.keyboard.press("Tab")
+# ----------------------------------------------------------------- the test steps
+def step_terms(page, data):
+    page.goto(BASE_URL + "/register", wait_until="networkidle")
+    expect(page.get_by_text("Register Your Agency").first).to_be_visible()
     page.wait_for_timeout(1000)
-    for attempt in range(4):
-        before = api["sent"]
-        api["limit"] = False
-        button.scroll_into_view_if_needed()
-        expect(button).to_be_enabled()
-        if attempt == 0:
-            button.click()
-        elif attempt == 1:
-            button.click(force=True)
-        elif attempt == 2:
-            button.focus()
-            page.keyboard.press("Enter")
-        else:
-            button.dispatch_event("click")
-        page.wait_for_timeout(1500)
-        if api["sent"] > before:                 # a request went out, so wait for the answer
-            for _ in range(60):
-                if target.is_visible():
-                    return
-                if api["limit"]:
-                    raise Exception("Server blocked this step with HTTP 429 (too many requests)")
-                page.wait_for_timeout(500)
-        elif target.is_visible():
-            return
-        print(f"Next click {attempt + 1} did not open the next page. Page errors: {page_errors(page)}")
-    raise Exception(f"Next did not open the next page. Page errors: {page_errors(page)}")
 
+    # tick the "I agree to the Terms of Service and Privacy Policy" box
+    checkbox = page.get_by_role("checkbox").first
+    try:
+        checkbox.click(timeout=3000)
+    except Exception:
+        checkbox.click(force=True)
 
-def wait_with_countdown(page, otp_title, seconds):
-    # the site may let us in by itself, so stop early if the OTP page shows up
-    end = time.time() + seconds
-    last = 0
-    while time.time() < end:
-        if otp_title.is_visible():
-            return True
-        if time.time() - last >= 15:
-            print(f"   {int(end - time.time())} seconds left")
-            last = time.time()
-        page.wait_for_timeout(1000)
-    return otp_title.is_visible()
-
-
-# ---------- the steps ----------
-def step_terms(page):
-    page.goto(URL + "/register")
-    page.get_by_role("checkbox").first.click()
+    shot(page, "01_terms_checkbox_ticked")
     page.get_by_role("button", name="Continue").click()
+    expect(page.get_by_text("Complete Your Agent Profile in Steps").first).to_be_visible()
+
+
+def step_account(page, data):
+    a = data["account"]
     expect(page.get_by_text("Provide your personal details.").first).to_be_visible()
 
+    fill_after_label(page, "First Name", a["first_name"])
+    fill_after_label(page, "Last Name", a["last_name"])
+    fill_after_label(page, "Email Address", a["email"])
+    page.get_by_placeholder("00-00000000").fill(a["phone"])
+    fill_after_label(page, "Password", a["password"])
+    fill_after_label(page, "Confirm Password", a["password"])
+    print("Using email:", a["email"], "| phone:", a["phone"])
 
-def step_account(page):
-    global phone_used
-    a = data["account"]
-    otp_title = page.get_by_text("Email Verification code").first
+    shot(page, "02_account_details_filled")
+    page.get_by_role("button", name="Next", exact=True).click()
 
-    fill(page, "First Name", a["first_name"])
-    fill(page, "Last Name", a["last_name"])
-    fill(page, "Email Address", a["email"])
-    fill_passwords(page, a["password"])
+    # the OTP page should open. If not, something was rejected by the server.
+    otp_heading = page.get_by_role("heading", name="Email Verification code", exact=True)
+    try:
+        expect(otp_heading).to_be_visible(timeout=15000)
+    except AssertionError:
+        raise AssertionError(
+            "OTP page did not open. Check the [API] lines above. "
+            "A 429 means too many requests: wait 30-60 minutes and try again."
+        )
 
-    for attempt in range(4):
-        phone_used = new_phone()
-        page.get_by_placeholder("00-00000000").fill(phone_used)
-        page.keyboard.press("Tab")              # leave the box so the site checks the phone
-        page.wait_for_timeout(1500)
-        if page.get_by_text("valid phone").count() > 0:
-            print("Phone rejected, trying another number")
-            continue
 
-        api["limit"] = False
-        click_next(page)
+def step_otp(page, data):
+    page.wait_for_timeout(500)
+    shot(page, "03_otp_page")
+    print("\n>>> OTP page reached. Type the code from your email and click 'Verify Code'.")
+    print(">>> Waiting up to 5 minutes...\n")
+    # we just wait until the next page (Agency Details) shows up
+    expect(page.get_by_text("About your Agency").first).to_be_visible(timeout=OTP_WAIT_MS)
 
-        for _ in range(150):                    # wait up to 60 seconds
-            page.wait_for_timeout(400)
-            if otp_title.is_visible():
-                return
-            if api["limit"] or page.get_by_text("valid phone").count() > 0:
+
+def step_agency(page, data):
+    g = data["agency"]
+    fill_after_label(page, "Name", g["name"])
+    fill_after_label(page, "Role in Agency", g["role"])
+    fill_after_label(page, "Email Address", g["email"])
+    fill_after_label(page, "Website", g["website"])
+    fill_after_label(page, "Address", g["address"])
+
+    # the region (Nepal) is usually already selected, so only pick it if missing
+    if page.get_by_text(g["region"], exact=True).count() == 0:
+        choose_from_dropdown(page, "Region of Operation", g["region"])
+
+    shot(page, "04_agency_details_filled")
+    page.get_by_role("button", name="Next", exact=True).click()
+
+
+def step_experience(page, data):
+    e = data["experience"]
+    expect(page.get_by_text("Experience and Performance Metrics").first).to_be_visible()
+
+    choose_from_dropdown(page, "Years of Experience", e["years"])
+    fill_after_label(page, "Number of Students Recruited Annually", e["students_recruited_annually"])
+    fill_after_label(page, "Focus Area", e["focus_area"])
+    fill_after_label(page, "Success Metrics", e["success_metrics"])
+    for service in e["services"]:
+        tick_checkbox(page, service)
+
+    shot(page, "05_professional_experience_filled")
+    page.get_by_role("button", name="Next", exact=True).click()
+
+
+def step_verification(page, data):
+    v = data["verification"]
+    expect(page.get_by_text("Provide Business Details and Set Preferences").first).to_be_visible()
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(1500)
+
+    # 1) Business Registration Number
+    fill_after_label(page, "Business Registration Number", v["business_registration_number"])
+
+    # 2) Preferred Countries: click the button to open the list, then click each country
+    trigger = page.locator("button, [role='combobox']").filter(
+        has_text=re.compile("preferred countries", re.I)
+    ).first
+    trigger.scroll_into_view_if_needed()
+    popup = page.locator(
+        "[role='listbox'], [cmdk-list], [role='menu'], [role='dialog'], "
+        "[data-radix-popper-content-wrapper]"
+    ).last
+
+    for country in v["preferred_countries"]:
+        if not popup.is_visible():  # open the list if it is closed
+            trigger.click()
+            page.wait_for_timeout(700)
+        search_box = popup.locator("input")
+        if search_box.count() > 0:  # if the list has a search box, type the country
+            search_box.first.fill(country)
+            page.wait_for_timeout(600)
+        popup.get_by_text(re.compile(re.escape(country), re.I)).first.click()
+        page.wait_for_timeout(500)
+    page.keyboard.press("Escape")  # close the list
+
+    # 3) Documents: "Add Documents" shows 3 upload boxes, then we put a file in each
+    add_button = page.locator("button").filter(has_text=re.compile("add documents", re.I))
+    file_inputs = page.locator("input[type='file']")
+    for _ in range(3):
+        if file_inputs.count() >= 3 or add_button.count() == 0:
+            break
+        add_button.first.click()
+        page.wait_for_timeout(1000)
+
+    image = str(make_png(Path("artifacts/business_document.png")))
+    print("Upload boxes found:", file_inputs.count())
+    for i in range(file_inputs.count()):
+        file_inputs.nth(i).set_input_files(image)
+        page.wait_for_timeout(1000)
+
+    # 4) Preferred Institution Types
+    for name in v["institution_types"]:
+        box = page.get_by_role("checkbox", name=name, exact=True)
+        try:
+            if not box.is_checked():  # some are already ticked, do not untick them
+                box.click(timeout=2000)
+        except Exception:
+            page.get_by_text(name, exact=True).first.click()
+
+    shot(page, "06_verification_preferences_filled", full=True)
+    page.locator("button").filter(has_text=re.compile(r"^\s*submit\s*$", re.I)).first.click()
+
+
+def step_confirmation(page, data):
+    # after Submit the site should move away from the register page
+    try:
+        page.wait_for_url(lambda url: "/register" not in url, timeout=20000)
+    except Exception:
+        print("Still on the register page after Submit")
+    page.wait_for_timeout(3000)
+    print("Final page:", page.url)
+    shot(page, "07_account_created", full=True)
+
+
+# ----------------------------------------------------------------- report + main
+def write_report(results):
+    lines = [
+        "# Signup Automation - Test Report",
+        "",
+        f"Run at: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "| Step | Result | Time (s) |",
+        "|------|--------|----------|",
+    ]
+    for name, status, seconds in results:
+        lines.append(f"| {name} | {status} | {seconds:.1f} |")
+    Path("test_report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def main():
+  
+    for old in SHOT_DIR.glob("*.png"):
+        old.unlink()
+
+    data = load_data()
+    steps = [
+        ("Accept terms", step_terms),
+        ("1. Set up your account", step_account),
+        ("OTP verification (typed by hand)", step_otp),
+        ("2. Agency details", step_agency),
+        ("3. Professional experience", step_experience),
+        ("4. Verification and preferences", step_verification),
+        ("5. Account created", step_confirmation),
+    ]
+    results = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, slow_mo=100)
+        page = browser.new_page(viewport={"width": 1400, "height": 900})
+        page.set_default_timeout(15000)
+        page.on("response", log_api)
+
+        for number, (name, step) in enumerate(steps, 1):
+            start = time.time()
+            try:
+                step(page, data)
+                results.append((name, "PASS", time.time() - start))
+                print("PASS:", name)
+            except Exception as error:
+                shot(page, f"FAILED_{number:02d}")
+                results.append((name, "FAIL", time.time() - start))
+                print("FAIL:", name)
+                print("Reason:", str(error).splitlines()[0])
                 break
 
-        if api["limit"]:
-            try:
-                wait = int(api["retry"])
-            except (TypeError, ValueError):
-                wait = int(os.getenv("RATE_LIMIT_WAIT", "300")) * (attempt + 1)
-            if wait > int(os.getenv("MAX_WAIT", "900")):    # longer than 15 minutes: do not sit and wait
-                until = time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + wait))
-                raise Exception(f"Server blocked the signup with HTTP 429. It asks to wait {wait // 60} minutes "
-                                f"(about {wait / 3600:.1f} hours). Try again after {until}.")
-            print(f"Server says too many requests (429). Waiting {wait} seconds, keep the window open")
-            if wait_with_countdown(page, otp_title, wait):
-                return
-        elif page.get_by_text("valid phone").count() == 0:
-            break
+        write_report(results)
+        print("\nReport written to test_report.md")
 
-    if api["seen_limit"]:
-        raise Exception("Server blocked the signup with HTTP 429 (too many requests)")
-    raise Exception("OTP page did not open")
+        # keep the browser open so we can look at the last page
+        if "--close" not in sys.argv:
+            input("\nPress Enter to close the browser... ")
+        browser.close()
+
+    failed = any(status == "FAIL" for _, status, _ in results)
+    sys.exit(1 if failed else 0)
 
 
-def step_otp(page):
-    expect(page.get_by_text("Email Verification code").first).to_be_visible()
-    code = os.getenv("SIGNUP_OTP") or input("Enter the OTP from your email: ").strip()
-    page.locator("input:visible").first.click()
-    page.keyboard.type(code, delay=150)
-    page.get_by_role("button", name=re.compile("verify", re.I)).click()
-    expect(page.get_by_text("About your Agency").first).to_be_visible(timeout=30000)
-
-
-def step_agency(page):
-    g = data["agency"]
-    fill(page, "Name", g["name"])
-    fill(page, "Role in Agency", g["role"])
-    fill(page, "Email Address", g["email"])
-    fill(page, "Website", g["website"])
-    fill(page, "Address", g["address"])
-    choose(page, "Region of Operation", g["region"])
-    page.keyboard.press("Escape")
-    go_next(page, page.get_by_text("Experience and Performance Metrics").first)
-
-
-def step_experience(page):
-    e = data["experience"]
-    choose(page, "Years of Experience", e["years"])
-    fill(page, "Number of Students Recruited Annually", e["students_recruited_annually"])
-    fill(page, "Focus Area", e["focus_area"])
-    fill(page, "Success Metrics", e["success_metrics"])
-    for service in e["services"]:
-        page.get_by_role("checkbox", name=service).first.click()
-    go_next(page, page.get_by_label(re.compile("business registration", re.I)).first)
-
-
-def step_verification(page):
-    v = data["verification"]
-    page.get_by_label(re.compile("business registration", re.I)).fill(v["business_registration_number"])
-    for country in v["preferred_countries"]:
-        choose(page, "Preferred Countries", country)
-    page.keyboard.press("Escape")
-    page.get_by_role("button", name=re.compile("submit|finish|complete|save", re.I)).last.click()
-    page.wait_for_timeout(4000)
-
-
-STEPS = [
-    ("Open register page and accept terms", step_terms),
-    ("1. Set up account (with phone number)", step_account),
-    ("Email OTP verification", step_otp),
-    ("2. Agency details", step_agency),
-    ("3. Professional experience", step_experience),
-    ("4. Verification and preferences", step_verification),
-]
-
-
-# ---------- report ----------
-def write_report(results, video_file):
-    passed = [r for r in results if r["status"] == "PASS"]
-    failed = [r for r in results if r["status"] == "FAIL"]
-    lines = ["# Signup Automation - Test Report", ""]
-    lines.append(f"Run at: {time.strftime('%Y-%m-%d %H:%M:%S')}  ")
-    lines.append(f"Site: {URL}", )
-    lines.append("")
-    if not failed and len(passed) == len(STEPS):
-        lines.append("**Result: PASS** - all 6 steps finished and the form was submitted.")
-    elif failed:
-        lines.append(f"**Result: FAIL** - {len(passed)} of {len(STEPS)} steps passed. "
-                     f"Stopped at: {failed[0]['name']}.")
-        lines.append(f"Reason: {failed[0]['note']}")
-    lines.append("")
-    lines.append("| # | Step | Result | Time (s) | Screenshot |")
-    lines.append("|---|------|--------|----------|------------|")
-    for i, r in enumerate(results, 1):
-        lines.append(f"| {i} | {r['name']} | {r['status']} | {r['secs']:.1f} | {r['shot']} |")
-    for name, _ in STEPS[len(results):]:
-        lines.append(f"| - | {name} | NOT RUN | - | - |")
-    lines.append("")
-    if api["seen_limit"]:
-        lines.append("Note: the site's server answered HTTP 429 (too many requests) to the signup request. "
-                     "This is a server rate limit, not a problem in the form filling.")
-        lines.append("")
-    lines.append("## Test data used")
-    lines.append(f"- Email: {data['account']['email']}")
-    lines.append(f"- Phone: {phone_used or '(not reached)'}")
-    lines.append(f"- Agency: {data['agency']['name']}")
-    lines.append("")
-    lines.append("## Files")
-    lines.append("- Screenshots: `screenshots/`")
-    lines.append(f"- Video: `{video_file or 'not recorded'}`")
-    with open("test_report.md", "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-
-# ---------- main ----------
-os.makedirs("screenshots", exist_ok=True)
-results = []
-
-with sync_playwright() as p:
-    browser = p.chromium.launch(headless=HEADLESS, slow_mo=0 if HEADLESS else 300, channel=CHANNEL)
-    context = browser.new_context(viewport={"width": 1300, "height": 850}, record_video_dir="videos")
-    page = context.new_page()
-    page.on("request", on_request)
-    page.on("response", on_response)
-    expect.set_options(timeout=20000)
-
-    for number, (name, func) in enumerate(STEPS, 1):
-        start = time.time()
-        short = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:30]
-        try:
-            func(page)
-            shot = f"screenshots/{number:02d}_{short}.png"
-            page.screenshot(path=shot)
-            results.append({"name": name, "status": "PASS", "secs": time.time() - start, "note": "", "shot": shot})
-            print("PASS:", name)
-        except Exception as error:
-            shot = f"screenshots/{number:02d}_{short}_FAILED.png"
-            try:
-                page.screenshot(path=shot)
-            except Exception:
-                shot = "-"
-            note = str(error).strip().splitlines()[0][:200] if str(error).strip() else type(error).__name__
-            results.append({"name": name, "status": "FAIL", "secs": time.time() - start, "note": note, "shot": shot})
-            print("FAIL:", name, "-", note)
-            break
-
-    video_path = page.video.path() if page.video else None
-    context.close()          # the video file is finished only after this
-    browser.close()
-
-video_file = None
-if video_path and os.path.exists(video_path):
-    video_file = "videos/demo_video.webm"
-    os.replace(video_path, video_file)
-
-write_report(results, video_file)
-print("Report saved: test_report.md")
+main()
