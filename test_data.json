@@ -1,0 +1,29 @@
+{
+  "account": {
+    "first_name": "Bhawana",
+    "last_name": "KC",
+    "email": "abishekb843+{ts}@gmail.com",
+    "phone": "{phone}",
+    "password": "Qa@Test2026#Xyz"
+  },
+  "agency": {
+    "name": "Himalayan Edu Consult {ts}",
+    "role": "Manager",
+    "email": "abishekb843+{ts}@gmail.com",
+    "website": "himalayanedu.com.np",
+    "address": "Lamachaur 19, Pokhara",
+    "region": "Nepal"
+  },
+  "experience": {
+    "years": "2 years",
+    "students_recruited_annually": "10",
+    "focus_area": "Undergraduate admission to US",
+    "success_metrics": "90",
+    "services": ["Career Counseling", "Admission Applications", "Visa Processing"]
+  },
+  "verification": {
+    "business_registration_number": "{ts}",
+    "preferred_countries": ["United States", "Canada"],
+    "institution_types": ["Universities", "Colleges"]
+  }
+}
