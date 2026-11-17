@@ -1,0 +1,11 @@
+[project]
+name = "signup-automation"
+version = "0.1.0"
+description = "End-to-end signup automation for The Authorized Partner (QA task)"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.48",
+]
+
+[tool.uv]
+package = false
